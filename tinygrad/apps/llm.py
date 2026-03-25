@@ -8,7 +8,7 @@ from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3"):
-    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo"): raise ValueError(f"Invalid tokenizer preset '{preset}'")
+    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","kimi-k2"): raise ValueError(f"Invalid tokenizer preset '{preset}'")
     # https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/encoder.py#L9
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]  # bytes that map to themselves
     self._byte_decoder = {chr(b): b for b in bs} | {chr(256+i): b for i,b in enumerate(b for b in range(256) if b not in bs)}
@@ -56,11 +56,12 @@ class SimpleTokenizer:
   def decode(self, ids:list[int]) -> str: return b''.join(self._tok2bytes[tid] for tid in ids).decode(errors='replace')
   def role(self, role:str):
     if self.preset == 'olmo': return self.encode("<|" + role + "|>\n")  # OLMoE Instruct format
+    if self.preset == 'kimi-k2': return self.encode("<|im_" + role + "|>" + role + "<|im_middle|>")
     if self.preset == 'qwen2': return self.encode("<|im_start|>" + role + "\n")
     return self.encode("<|start_header_id|>" + role + "<|end_header_id|>\n\n")
   def end_turn(self, eos_id:int):
     if self.preset == 'olmo': return self.encode("\n")
-    if self.preset == 'qwen2': return [eos_id] + self.encode("\n")
+    if self.preset in ('qwen2', 'kimi-k2'): return [eos_id] + self.encode("\n")
     return [eos_id]
 
 @functools.cache
@@ -99,18 +100,40 @@ class TransformerConfig:
   num_experts: int = 0
   num_experts_per_tok: int = 0
   norm_topk_prob: bool = False
+  # MLA (Multi-head Latent Attention)
+  kv_lora_rank: int = 0
+  qk_nope_head_dim: int = 0
+  qk_rope_head_dim: int = 0
+  v_head_dim: int = 0
+  # shared experts
+  shared_expert_dim: int = 0
+  n_shared_experts: int = 0
+  # dense-then-MoE
+  leading_dense_blocks: int = 0
+  dense_hidden_dim: int = 0
+  routed_scaling_factor: float = 1.0
 
 class TransformerBlock:
   def __init__(self, config:TransformerConfig):
     self.config = config
 
     # --- attention projections (all linear, bias-free) ------------------
-    q_proj_out       = config.head_dim * config.n_heads
-    kv_proj_out      = config.head_dim * config.n_kv_heads
-    self.attn_q      = nn.Linear(config.dim, q_proj_out,  bias=False)
-    self.attn_k      = nn.Linear(config.dim, kv_proj_out, bias=False)
-    self.attn_v      = nn.Linear(config.dim, kv_proj_out, bias=False)
-    self.attn_output = nn.Linear(q_proj_out, config.dim,  bias=False)
+    if config.kv_lora_rank > 0:
+      # MLA: compressed KV + separate rope key
+      self.attn_q = nn.Linear(config.dim, config.n_heads * (config.qk_nope_head_dim + config.qk_rope_head_dim), bias=False)
+      self.attn_kv_a_mqa = nn.Linear(config.dim, config.kv_lora_rank + config.qk_rope_head_dim, bias=False)
+      self.attn_kv_a_norm = nn.RMSNorm(config.kv_lora_rank, config.norm_eps)
+      # 3D weights loaded from GGUF as attn_k_b.weight / attn_v_b.weight — renamed in from_gguf
+      self.attn_k_b_weight = Tensor.zeros(config.n_heads, config.kv_lora_rank, config.qk_nope_head_dim)
+      self.attn_v_b_weight = Tensor.zeros(config.n_heads, config.v_head_dim, config.kv_lora_rank)
+      self.attn_output = nn.Linear(config.n_heads * config.v_head_dim, config.dim, bias=False)
+    else:
+      q_proj_out       = config.head_dim * config.n_heads
+      kv_proj_out      = config.head_dim * config.n_kv_heads
+      self.attn_q      = nn.Linear(config.dim, q_proj_out,  bias=False)
+      self.attn_k      = nn.Linear(config.dim, kv_proj_out, bias=False)
+      self.attn_v      = nn.Linear(config.dim, kv_proj_out, bias=False)
+      self.attn_output = nn.Linear(q_proj_out, config.dim,  bias=False)
 
     # --- RMSNorms --------------------------------------------------------
     self.attn_norm   = nn.RMSNorm(config.dim, config.norm_eps)
@@ -119,10 +142,15 @@ class TransformerBlock:
 
     # --- feed-forward (MoE or dense) -------------------------------------
     if config.num_experts > 0:
-      self.ffn_gate_inp = nn.Linear(config.dim, config.num_experts, bias=False)  # router
+      self.ffn_gate_inp = nn.Linear(config.dim, config.num_experts, bias=False)
+      if config.kv_lora_rank > 0: self.exp_probs_b_bias = Tensor.zeros(config.num_experts)  # routing bias for deepseek2
       self.ffn_gate_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
       self.ffn_up_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
       self.ffn_down_exps = ExpertWeights(config.num_experts, config.hidden_dim, config.dim)
+      if config.shared_expert_dim > 0:
+        self.ffn_gate_shexp = nn.Linear(config.dim, config.shared_expert_dim, bias=False)
+        self.ffn_up_shexp = nn.Linear(config.dim, config.shared_expert_dim, bias=False)
+        self.ffn_down_shexp = nn.Linear(config.shared_expert_dim, config.dim, bias=False)
     else:
       self.ffn_gate    = nn.Linear(config.dim, config.hidden_dim, bias=False)
       self.ffn_up      = nn.Linear(config.dim, config.hidden_dim, bias=False)
@@ -130,54 +158,111 @@ class TransformerBlock:
 
   @function
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
-    x_norm = self.attn_norm(x)                       # (B,T,D)
-    q, k, v = self.attn_q(x_norm), self.attn_k(x_norm), self.attn_v(x_norm)
-    if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
-
     B, T, _ = x.shape
-    q = q.reshape(B, T, self.config.n_heads,    self.config.head_dim).transpose(1, 2)  # (B,H,T,Hd)
-    k = k.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
-    v = v.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
-    if self.config.qk_norm == self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
+    c = self.config
+    x_norm = self.attn_norm(x)
 
-    q = apply_rope(q, self.freqs_cis[start_pos:start_pos+T])
-    k = apply_rope(k, self.freqs_cis[start_pos:start_pos+T])
+    if c.kv_lora_rank > 0:
+      # MLA with absorption: Q_nope is absorbed into compressed space, K/V stay compressed in cache
+      q = self.attn_q(x_norm).reshape(B, T, c.n_heads, c.qk_nope_head_dim + c.qk_rope_head_dim).transpose(1, 2)
+      q_nope, q_rope = q[..., :c.qk_nope_head_dim], q[..., c.qk_nope_head_dim:]  # (B, H, T, nope), (B, H, T, rope)
+      q_rope = apply_rope(q_rope, self.freqs_cis[start_pos:start_pos+T])
 
-    # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
-    assigned_kv = Tensor(self.cache_kv.uop.after(self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).uop)))
-    k = assigned_kv[0, :, :, 0:start_pos+T, :]
-    v = assigned_kv[1, :, :, 0:start_pos+T, :]
+      # absorb q_nope into compressed space: q_nope @ wk_b^T -> (B, H, T, kv_lora_rank)
+      q_nope_absorbed = q_nope @ self.attn_k_b_weight.transpose(-1, -2)  # (B, H, T, kv_lora_rank)
 
-    #self.cache_kv[:, :, :, start_pos:start_pos+T, :].assign(Tensor.stack(k, v))
-    #k = self.cache_kv[0, :, :, 0:start_pos+T, :]
-    #v = self.cache_kv[1, :, :, 0:start_pos+T, :]
+      # compress KV, split off rope portion
+      kv_a = self.attn_kv_a_mqa(x_norm)
+      c_kv, k_rope = kv_a[..., :c.kv_lora_rank], kv_a[..., c.kv_lora_rank:]
+      c_kv = self.attn_kv_a_norm(c_kv)
+      k_rope = k_rope.reshape(B, T, 1, c.qk_rope_head_dim).transpose(1, 2)
+      k_rope = apply_rope(k_rope, self.freqs_cis[start_pos:start_pos+T])
 
-    # NOTE: this mask is causal_lower_right, not the causal_upper_left generated by is_casual = True
-    # TODO: this if statement should be removed and it shouldn't generate extra kernels
+      # cache compressed kv and k_rope: K=(kv_lora_rank+rope, 1 head), V=(kv_lora_rank, 1 head)
+      k_cache = c_kv.reshape(B, 1, T, c.kv_lora_rank).cat(k_rope.reshape(B, 1, T, c.qk_rope_head_dim), dim=-1)
+      v_cache = c_kv.reshape(B, 1, T, c.kv_lora_rank)
+      # pad v_cache to match k_cache dim for Tensor.stack
+      v_cache_padded = v_cache.pad((0, c.qk_rope_head_dim))
+      assigned = Tensor(self.cache_kv.uop.after(
+        self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k_cache, v_cache_padded).uop)))
+      k_cached = assigned[0, :, :, 0:start_pos+T, :]  # (B, 1, S, kv_lora_rank+rope)
+      v_cached = assigned[1, :, :, 0:start_pos+T, :c.kv_lora_rank]  # (B, 1, S, kv_lora_rank)
+
+      # split cached K into compressed and rope parts
+      k_compressed = k_cached[..., :c.kv_lora_rank]   # (B, 1, S, kv_lora_rank)
+      k_rope_cached = k_cached[..., c.kv_lora_rank:]  # (B, 1, S, rope)
+
+      # Q = concat(q_nope_absorbed, q_rope) in (kv_lora_rank+rope) space
+      q_final = q_nope_absorbed.cat(q_rope, dim=-1)  # (B, H, T, kv_lora_rank+rope)
+      # K = concat(k_compressed, k_rope) — already in the right shape (B, 1, S, kv_lora_rank+rope)
+      k_final = k_compressed.cat(k_rope_cached, dim=-1)
+
+      # attention in compressed space, then apply wv_b to get final values
+      mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(start_pos+1) if resolve(T != 1) else None
+      # scale by original head dim (nope+rope), not absorbed dim
+      attn_weights = q_final @ k_final.transpose(-1, -2)
+      attn_weights = attn_weights * (1.0 / (c.qk_nope_head_dim + c.qk_rope_head_dim) ** 0.5)
+      if mask is not None: attn_weights = attn_weights + mask
+      attn_weights = attn_weights.softmax(-1)  # (B, H, T, S)
+      # attn @ v_cached -> (B, H, T, kv_lora_rank), then apply wv_b -> (B, H, T, v_head_dim)
+      attn_out = (attn_weights @ v_cached) @ self.attn_v_b_weight.transpose(-1, -2)  # (B, H, T, v_head_dim)
+      attn = attn_out.transpose(1, 2).reshape(B, T, -1)
+      return x + self.attn_output(attn)
+    else:
+      q, k, v = self.attn_q(x_norm), self.attn_k(x_norm), self.attn_v(x_norm)
+      if c.qk_norm and c.qk_norm != c.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
+      q = q.reshape(B, T, c.n_heads,    c.head_dim).transpose(1, 2)
+      k = k.reshape(B, T, c.n_kv_heads, c.head_dim).transpose(1, 2)
+      v = v.reshape(B, T, c.n_kv_heads, c.head_dim).transpose(1, 2)
+      if c.qk_norm == c.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
+      q = apply_rope(q, self.freqs_cis[start_pos:start_pos+T])
+      k = apply_rope(k, self.freqs_cis[start_pos:start_pos+T])
+      assigned = Tensor(self.cache_kv.uop.after(self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).uop)))
+      k = assigned[0, :, :, 0:start_pos+T, :]
+      v = assigned[1, :, :, 0:start_pos+T, :]
+
     mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(start_pos+1) if resolve(T != 1) else None
-    attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
-    attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
-    attn = self.attn_output(attn)
-    return x + attn
+    attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
+    attn = attn.transpose(1, 2).reshape(B, T, -1)
+    return x + self.attn_output(attn)
 
   @function
   def _feed_forward(self, h: Tensor) -> Tensor:
     h_norm = self.ffn_norm(h)
     if hasattr(self, 'ffn_gate_exps'):
       x = h_norm.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
-      probs, sel = self.ffn_gate_inp(h_norm).softmax(-1).topk(self.config.num_experts_per_tok)  # (B, T, k) each
+      logits = self.ffn_gate_inp(h_norm)
+      if hasattr(self, 'exp_probs_b_bias'):
+        # DeepSeek-V2 sigmoid routing: bias for selection, unbiased sigmoid for weights
+        probs = logits.sigmoid()
+        _, sel = (probs + self.exp_probs_b_bias).topk(self.config.num_experts_per_tok)
+        probs = probs.gather(-1, sel)  # get unbiased probs for selected experts
+      else:
+        probs, sel = logits.softmax(-1).topk(self.config.num_experts_per_tok)
       if self.config.norm_topk_prob: probs = probs / probs.sum(axis=-1, keepdim=True)
+      probs = probs * self.config.routed_scaling_factor
       x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x))  # (B, T, k, D)
-      return h + (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
+      out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
+      if hasattr(self, 'ffn_gate_shexp'):
+        shexp = self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu().contiguous() * self.ffn_up_shexp(h_norm))
+        if hasattr(self, 'ffn_gate_inp_shexp_weight'):
+          shexp = shexp * (h_norm * self.ffn_gate_inp_shexp_weight).sum(axis=-1, keepdim=True).sigmoid()
+        out = out + shexp
+      return h + out
     # TODO: remove the need for this contiguous
     gated  = self.ffn_gate(h_norm).silu().contiguous() * self.ffn_up(h_norm)
     return h + self.ffn_down(gated)
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
     if not hasattr(self, "cache_kv"):
-      # TODO: how is the dtype of this determined?
-      self.cache_kv = Tensor.empty(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim, device=x.device)
-      self.freqs_cis = precompute_freqs_cis(self.config.head_dim, self.config.max_context, self.config.rope_theta)
+      c = self.config
+      if c.kv_lora_rank > 0:
+        # MLA absorbed: cache compressed KV (kv_lora_rank + rope dims, 1 head)
+        self.cache_kv = Tensor.empty(2, x.shape[0], 1, c.max_context, c.kv_lora_rank + c.qk_rope_head_dim, device=x.device)
+        self.freqs_cis = precompute_freqs_cis(c.qk_rope_head_dim, c.max_context, c.rope_theta)
+      else:
+        self.cache_kv = Tensor.empty(2, x.shape[0], c.n_kv_heads, c.max_context, c.head_dim, device=x.device)
+        self.freqs_cis = precompute_freqs_cis(c.head_dim, c.max_context, c.rope_theta)
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp): return self._feed_forward(self._attention(x, start_pos)).contiguous()
@@ -185,7 +270,11 @@ class TransformerBlock:
 
 class Transformer:
   def __init__(self, config:TransformerConfig):
-    self.blk = [TransformerBlock(config) for _ in range(config.num_blocks)]
+    from dataclasses import replace
+    dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, n_shared_experts=0,
+                           hidden_dim=config.dense_hidden_dim or config.hidden_dim)
+    self.blk = [(TransformerBlock(dense_config) if i < config.leading_dense_blocks else TransformerBlock(config))
+                for i in range(config.num_blocks)]
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
@@ -226,16 +315,29 @@ class Transformer:
         if 'attn_q.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_heads, two=2)
         if 'attn_k.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_kv_heads, two=2)
 
+    kv_lora_rank = kv.get(f'{arch}.attention.kv_lora_rank', 0)
+    # rename MLA weight keys to match our attribute names
+    if kv_lora_rank:
+      renames = {'attn_k_b.weight': 'attn_k_b_weight', 'attn_v_b.weight': 'attn_v_b_weight', 'exp_probs_b.bias': 'exp_probs_b_bias'}
+      state_dict = {functools.reduce(lambda k, r: k.replace(*r), renames.items(), k): v for k, v in state_dict.items()}
     config = TransformerConfig(
       num_blocks=kv[f'{arch}.block_count'], dim=kv[f'{arch}.embedding_length'],
       hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv[f'{arch}.feed_forward_length']),
       n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'],
       vocab_size=len(kv['tokenizer.ggml.tokens']),
-      head_dim=kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads),
+      head_dim=kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads) if not kv_lora_rank else 0,
       rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context,
       qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
       num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
-      norm_topk_prob=arch == 'qwen3moe')
+      norm_topk_prob=arch in ('qwen3moe', 'deepseek2'),
+      kv_lora_rank=kv_lora_rank,
+      qk_nope_head_dim=kv.get(f'{arch}.attention.key_length_mla', 0) - kv.get(f'{arch}.rope.dimension_count', 0) if kv_lora_rank else 0,
+      qk_rope_head_dim=kv.get(f'{arch}.rope.dimension_count', 0) if kv_lora_rank else 0,
+      v_head_dim=kv.get(f'{arch}.attention.value_length_mla', 0),
+      shared_expert_dim=kv.get(f'{arch}.expert_shared_count', 0) * kv.get(f'{arch}.expert_feed_forward_length', 0),
+      leading_dense_blocks=kv.get(f'{arch}.leading_dense_block_count', 0),
+      dense_hidden_dim=kv.get(f'{arch}.feed_forward_length', 0) if kv.get(f'{arch}.leading_dense_block_count', 0) else 0,
+      routed_scaling_factor=kv.get(f'{arch}.expert_weights_scale', 1.0))
     model = Transformer(config)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
